@@ -7,7 +7,11 @@ use BerkeleyDB;
 use locale;
 use Search::QueryParser;
 
-our $VERSION = "0.70";
+
+# TODO : experiment with bit vectors (cf vec() and pack "b*" for combining 
+#        result sets
+
+our $VERSION = "0.71";
 
 =head1 NAME
 
@@ -34,7 +38,7 @@ Search::Indexer - full-text indexer
 
   my $result2 = $ix->search('word1 AND (word2 OR word3) AND NOT word4');
 
-  $ix->remove($someDocId, $docs{$someDocId});
+  $ix->remove($someDocId);
 
 =head1 DESCRIPTION
 
@@ -255,6 +259,7 @@ sub new {
 	       ctxtNumChars maxExcerpts preMatch postMatch);
 
   my $dir = $args->{dir} || ".";
+  $dir =~ s{[/\\]$}{};		# remove trailing slash
 
   # BerkeleyDB environment should allow us to do proper locking for 
   # concurrent access ; but seems to be incompatible with the 
@@ -267,21 +272,29 @@ sub new {
 #     -Verbose => 1
 #       or confess "new BerkeleyDB::Env : $^E  $BerkeleyDB::Error" ;
 
+
+  my @bdb_args = (# -Env => $dbEnv, # commented out, see explanation above
+		  -Flags => ($self->{writeMode} ? DB_CREATE : DB_RDONLY),
+		  ($self->{writeMode} ? (-Cachesize => WRITECACHESIZE) : ()));
+
   # 3 index files :
   # ixw : word => wordId (or -1 for stopwords)
+  $self->{ixwDb} = tie %{$self->{ixw}}, 
+    'BerkeleyDB::Btree', 
+      -Filename => "$dir/ixw.bdb", @bdb_args
+	or confess "open $args->{dir}/ixw.bdb : $^E $BerkeleyDB::Error";
+
   # ixd : wordId => list of (docId, nOccur)
-  # ixp : (wordId, docId) => list of positions of word in doc
-  foreach my $ix (qw(ixw ixd ixp)) {
-    tie %{$self->{$ix}}, 'BerkeleyDB::Hash', 
-      -Filename => "$dir/$ix.bdb",
-      # -Env => $dbEnv, # environment commented out, see explanation above
-      -Flags => ($self->{writeMode} ? DB_CREATE : DB_RDONLY),
+  $self->{ixdDb} = tie %{$self->{ixd}}, 
+    'BerkeleyDB::Hash', 
+      -Filename => "$dir/ixd.bdb", @bdb_args
+	or confess "open $args->{dir}/ixd.bdb : $^E $BerkeleyDB::Error";
 
-      ($self->{writeMode} ? (-Cachesize => WRITECACHESIZE) : ())
-	  or confess "open $args->{dir}/$ix.bdb : $^E $BerkeleyDB::Error"
-
- ;
-  }
+  # ixp : (docId, wordId) => list of positions of word in doc
+  $self->{ixpDb} = tie %{$self->{ixp}}, 
+    'BerkeleyDB::Btree', 
+      -Filename => "$dir/ixp.bdb", @bdb_args
+	or confess "open $args->{dir}/ixp.bdb : $^E $BerkeleyDB::Error";
 
   # optional list of stopwords may be given as a list or as a filename
   if ($args->{stopwords}) { 
@@ -323,6 +336,17 @@ sub add {
 
   confess "docId $docId is too large" if $docId > MAX_DOC_ID;
 
+  # first check if this docId is already used
+  my $c = $self->{ixpDb}->db_cursor;
+  my $k = pack IXPKEYPACK, $docId, 0;
+  my $v;			# not used, but needed by c_get()
+  my $status = $c->c_get($k, $v, DB_SET_RANGE);
+  if ($status == 0) {
+    my ($check, $wordId) = unpack IXPKEYPACK, $k;
+    confess "docId $docId is already used (wordId=$wordId)" if $docId == $check;
+  }
+
+  # OK, let's extract words from the $_[0] buffer
   my %positions;
   for (my $nwords = 1; $_[0] =~ /$self->{wregex}/g; $nwords++) {	
 
@@ -346,27 +370,20 @@ sub add {
 }
 
 
-=item C<remove(docId, buf)>
+=item C<remove(docId)>
 
 Removes a document from the index.
-I<Buf> must be supplied again and should be identical to what was
-supplied at the time the document was added.
 
 =cut
 
 sub remove {
   my $self = shift;
   my $docId = shift;
-  # my $buf = shift; # using $_[0] instead for efficiency reasons
 
-  my %words;
-  for (my $nwords = 1; $_[0] =~ /$self->{wregex}/g; $nwords++) {	
-    my $word = $self->{wfilter}->($&) or next;
-    my $wordId = $self->{ixw}{$word} || 0;
-    $words{$wordId} = 1 if $wordId > 0; 
-  }
+  my $wordIds = $self->wordIds($docId);
+  return if not @$wordIds;
 
-  foreach my $wordId (keys %words) {
+  foreach my $wordId (@$wordIds) {
     my %docs = unpack IXDPACK_L, $self->{ixd}{$wordId};
     delete $docs{$docId};
     $self->{ixd}{$wordId} = pack IXDPACK_L, %docs;
@@ -375,6 +392,57 @@ sub remove {
   }
 
   $self->{ixd}{NDOCS} -= 1;
+}
+
+=item C<wordIds(docId)>
+
+Returns a ref to an array of word Ids contained in the specified document
+
+=cut
+
+sub wordIds {
+  my $self = shift;
+  my $docId_ini = shift;
+
+  my @wordIds = ();
+  my $c = $self->{ixpDb}->db_cursor;
+  my ($k, $v);
+  $k = pack IXPKEYPACK, $docId_ini, 0;
+  my $status = $c->c_get($k, $v, DB_SET_RANGE);
+  while ($status == 0) {
+    my ($docId, $wordId) = unpack IXPKEYPACK, $k;
+    last if $docId != $docId_ini;
+    push @wordIds, $wordId;
+    $status = $c->c_get($k, $v, DB_NEXT);
+  }
+  return \@wordIds;
+}
+
+
+=item C<words(prefix)>
+
+Returns a ref to an array of words found in the dictionary, 
+starting with prefix (i.e. C<< $ix->words("foo") >> will
+return "foo", "food", "fool", "footage", etc.).
+
+=cut
+
+sub words {
+  my $self = shift;
+  my $prefix = shift;
+
+  my $regex = qr/^$prefix/;
+  my @words = ();
+  my $c = $self->{ixwDb}->db_cursor;
+  my ($k, $v);
+  $k = $prefix;
+  my $status = $c->c_get($k, $v, DB_SET_RANGE);
+  while ($status == 0) {
+    last if $k !~ $regex;
+    push @words, $k;
+    $status = $c->c_get($k, $v, DB_NEXT);
+  }
+  return \@words;
 }
 
 
@@ -490,7 +558,7 @@ sub _search {
     }
   }
 
-  return undef if not $scores; # no results, no need to check negative subQ
+  return undef if not $scores or not %$scores; # no results
 
   # 3) deal with negative subqueries (remove corresponding docs from results)
 
@@ -607,12 +675,13 @@ sub translateQuery { # replace words by ids, remove irrelevant subqueries
 		  value => $self->translateQuery($val, $killedWords, $wordsRegexes)};
       }
       elsif ($subQ->{op} eq ':') {
+	# split query according to our notion of "term"
+	my @words = ($val =~ /$self->{wregex}/g);
 
-	# get back all words parsed by QueryParser into a single string ..
-	my $str = ref $val ? join(" ", @$val) : $val;
+# TODO : 1) accept '*' suffix; 2) find keys in $self->{ixw}; 3) rewrite into
+#        an 'OR' query
 
-	# ..and resplit them according to our notion of "term"
-	my @words = ($str =~ /$self->{wregex}/g);
+#	my @words = ($str =~ /$self->{wregex}\*?/g);
 
 	push @$wordsRegexes, join "\\W+", @words;
 	push @$wordsRegexes, join "\\W+", map {$self->{wfilter}($_)} @words;
@@ -657,7 +726,7 @@ sub excerpts {
 
   my $nc = $self->{ctxtNumChars};
 
-  # find start end end positions of matching fragments
+  # find start and end positions of matching fragments
   my $matches = []; # array of refs to [start, end, number_of_matches]
   while ($_[0] =~ /$regex/g) {
     my ($start, $end) = ($-[0], $+[0]);
