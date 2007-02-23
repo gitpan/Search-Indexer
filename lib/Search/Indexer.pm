@@ -1,7 +1,8 @@
 package Search::Indexer;
 
 use strict;
-use warnings;
+use warnings; 
+# no warnings 'uninitialized'; ## CHECK IF NEEDED OR NOT
 use Carp;
 use BerkeleyDB;
 use locale;
@@ -11,7 +12,7 @@ use Search::QueryParser;
 # TODO : experiment with bit vectors (cf vec() and pack "b*" for combining 
 #        result sets
 
-our $VERSION = "0.71";
+our $VERSION = "0.72";
 
 =head1 NAME
 
@@ -180,7 +181,8 @@ Give a true value if you intend to write into the index.
 
 Regex for matching a word (C<qr/\w+/> by default).
 Will affect both L<add> and L<search> method.
-This regex should not contain any capturing parentheses.
+This regex should not contain any capturing parentheses
+(use non-capturing parentheses C<< (?: ... ) >> instead).
 
 =item wfilter
 
@@ -194,7 +196,7 @@ accented characters into plain characters.
 List of words that will be marked into the index as "words to exclude".
 This should usually occur when creating a new index ; but nothing prevents
 you to add other stopwords later. Since stopwords are stored in the
-index, they need not be specified When opening an index for searches or 
+index, they need not be specified when opening an index for searches or 
 updates.
 
 The list may be supplied either as a ref to an array of scalars, or 
@@ -511,7 +513,7 @@ sub search {
 
   my $tmp = {};
   $tmp->{$_} = 1 foreach @$wordsRegexes;
-  my $strRegex = "\\b(?:" . join("|", keys %$tmp) . ")\\b";
+  my $strRegex = "(?:" . join("|", keys %$tmp) . ")";
 
   return {scores => $self->_search($qt), 
 	  killedWords => [keys %$killedWords],
@@ -683,8 +685,15 @@ sub translateQuery { # replace words by ids, remove irrelevant subqueries
 
 #	my @words = ($str =~ /$self->{wregex}\*?/g);
 
-	push @$wordsRegexes, join "\\W+", @words;
-	push @$wordsRegexes, join "\\W+", map {$self->{wfilter}($_)} @words;
+        my $regex1 = join "\\W+", map quotemeta, @words;
+        my $regex2 = join "\\W+", map quotemeta, 
+                                  map {$self->{wfilter}($_)} @words;
+        foreach my $regex ($regex1, $regex2) {
+          $regex = "\\b$regex" if $regex =~ /^\w/;
+          $regex = "$regex\\b" if $regex =~ /\w$/;
+        }
+	push @$wordsRegexes, $regex1;
+	push @$wordsRegexes, $regex2 unless $regex1 eq $regex2;
 	
 	# now translate into word ids
 	foreach my $word (@words) {
