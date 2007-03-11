@@ -12,7 +12,7 @@ use Search::QueryParser;
 # TODO : experiment with bit vectors (cf vec() and pack "b*" for combining 
 #        result sets
 
-our $VERSION = "0.73";
+our $VERSION = "0.74";
 
 =head1 NAME
 
@@ -290,7 +290,8 @@ sub new {
   my @remaining = keys %$args;
   croak "unexpected option : $remaining[0]" if @remaining;
   croak "can't add 'positions' after index creation time"
-    if $self->{positions} and -f "$dir/ixd.bdb" and not -f "$dir/ixp.bdb";
+    if $self->{writeMode} and $self->{positions} 
+       and -f "$dir/ixd.bdb" and not -f "$dir/ixp.bdb";
 
   # BerkeleyDB environment should allow us to do proper locking for 
   # concurrent access ; but seems to be incompatible with the 

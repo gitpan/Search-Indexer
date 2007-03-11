@@ -1,5 +1,8 @@
 Revision history for Perl extension Search::Indexer.
 
+0.74 11.03.2007
+  - bug fix in checking "positions" option
+
 0.73 11.03.2007
   - added option "positions => 0" for smaller (yet less precise) indexes
 
