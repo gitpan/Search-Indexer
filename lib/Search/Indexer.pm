@@ -12,7 +12,7 @@ use Search::QueryParser;
 # TODO : experiment with bit vectors (cf vec() and pack "b*" for combining 
 #        result sets
 
-our $VERSION = "0.72";
+our $VERSION = "0.73";
 
 =head1 NAME
 
@@ -153,7 +153,8 @@ use constant {
     ctxtNumChars => 35,
     maxExcerpts  => 5,
     preMatch     => "<b>",
-    postMatch    => "</b>"
+    postMatch    => "</b>",
+    positions    => 1,
   }
 };
 
@@ -247,6 +248,27 @@ String to insert in contextual excerpts after a matched word.
 Default is C<"E<lt>/bE<gt>">.
 
 
+=item positions
+
+  my $indexer = new Search::Indexer(dir       => $dir, 
+                                    writeMode => 1,
+                                    positions => 0);
+
+Truth value to tell whether or not, when creating a new index,
+word positions should be stored. The default is true.
+
+If you turn it off, index files will be much smaller, indexing
+will be faster, but results will be less precise, 
+because the indexer can no longer find "exact phrases". 
+So if you type  C<"quick fox jumped">, the query will be 
+translated into C<quick AND fox AND jumped>, and therefore
+will retrieve documents in which those three words are present, but
+not necessarily in order.
+
+Another consequence of C<< positions => 0 >> is that
+there will be no automatic check of uniqueness of ids
+when adding documents into the index.
+
 =back
 
 =cut
@@ -255,13 +277,20 @@ sub new {
   my $class = shift;
   my $args = ref $_[0] eq 'HASH' ? $_[0] : {@_};
 
+  # parse options
   my $self = {};
-  $self->{$_} = $args->{$_} || DEFAULT->{$_} 
+  $self->{$_} = exists $args->{$_} ? delete $args->{$_} : DEFAULT->{$_} 
     foreach qw(writeMode wregex wfilter fieldname 
-	       ctxtNumChars maxExcerpts preMatch postMatch);
-
-  my $dir = $args->{dir} || ".";
+               ctxtNumChars maxExcerpts preMatch postMatch positions);
+  my $dir = delete $args->{dir} || ".";
   $dir =~ s{[/\\]$}{};		# remove trailing slash
+  my $stopwords = delete $args->{stopwords};
+
+  # check if invalid options
+  my @remaining = keys %$args;
+  croak "unexpected option : $remaining[0]" if @remaining;
+  croak "can't add 'positions' after index creation time"
+    if $self->{positions} and -f "$dir/ixd.bdb" and not -f "$dir/ixp.bdb";
 
   # BerkeleyDB environment should allow us to do proper locking for 
   # concurrent access ; but seems to be incompatible with the 
@@ -272,7 +301,7 @@ sub new {
 #     -Flags => DB_INIT_CDB | DB_INIT_MPOOL | DB_CDB_ALLDB |
 #                 ($self->{writeMode} ? DB_CREATE : 0),
 #     -Verbose => 1
-#       or confess "new BerkeleyDB::Env : $^E  $BerkeleyDB::Error" ;
+#       or croak "new BerkeleyDB::Env : $^E  $BerkeleyDB::Error" ;
 
 
   my @bdb_args = (# -Env => $dbEnv, # commented out, see explanation above
@@ -284,33 +313,36 @@ sub new {
   $self->{ixwDb} = tie %{$self->{ixw}}, 
     'BerkeleyDB::Btree', 
       -Filename => "$dir/ixw.bdb", @bdb_args
-	or confess "open $args->{dir}/ixw.bdb : $^E $BerkeleyDB::Error";
+	or croak "open $dir/ixw.bdb : $^E $BerkeleyDB::Error";
 
   # ixd : wordId => list of (docId, nOccur)
   $self->{ixdDb} = tie %{$self->{ixd}}, 
     'BerkeleyDB::Hash', 
       -Filename => "$dir/ixd.bdb", @bdb_args
-	or confess "open $args->{dir}/ixd.bdb : $^E $BerkeleyDB::Error";
+	or croak "open $dir/ixd.bdb : $^E $BerkeleyDB::Error";
 
-  # ixp : (docId, wordId) => list of positions of word in doc
-  $self->{ixpDb} = tie %{$self->{ixp}}, 
-    'BerkeleyDB::Btree', 
-      -Filename => "$dir/ixp.bdb", @bdb_args
-	or confess "open $args->{dir}/ixp.bdb : $^E $BerkeleyDB::Error";
+  if (-f "$dir/ixp.bdb" || $self->{writeMode} && $self->{positions}) {
+    # ixp : (docId, wordId) => list of positions of word in doc
+    $self->{ixpDb} = tie %{$self->{ixp}}, 
+      'BerkeleyDB::Btree', 
+        -Filename => "$dir/ixp.bdb", @bdb_args
+          or croak "open $dir/ixp.bdb : $^E $BerkeleyDB::Error";
+  }
+
 
   # optional list of stopwords may be given as a list or as a filename
-  if ($args->{stopwords}) { 
-    $self->{writeMode} or confess "must be in writeMode to specify stopwords";
-    if (not ref $args->{stopwords}) { # if scalar, name of stopwords file
-      open TMP, $args->{stopwords} or 
-	($args->{dir} and open TMP, "$args->{dir}/$args->{stopwords}") or
-	  confess "open stopwords file $args->{stopwords} : $^E ";
+  if ($stopwords) { 
+    $self->{writeMode} or croak "must be in writeMode to specify stopwords";
+    if (not ref $stopwords) { # if scalar, name of stopwords file
+      open TMP, $stopwords or 
+	(open TMP, "$dir/$stopwords") or
+	  croak "open stopwords file $stopwords : $^E ";
       local $/ = undef;
       my $buf = <TMP>;
-      $args->{stopwords} = [$buf =~ /$self->{wregex}/g];
+      $stopwords = [$buf =~ /$self->{wregex}/g];
       close TMP;
     }
-    foreach my $word (@{$args->{stopwords}}) {
+    foreach my $word (@$stopwords) {
       $self->{ixw}{$word} = -1;
     }
   }
@@ -336,16 +368,19 @@ sub add {
   my $docId = shift;
   # my $buf = shift; # using $_[0] instead for efficiency reasons
 
-  confess "docId $docId is too large" if $docId > MAX_DOC_ID;
+  croak "docId $docId is too large" if $docId > MAX_DOC_ID;
 
   # first check if this docId is already used
-  my $c = $self->{ixpDb}->db_cursor;
-  my $k = pack IXPKEYPACK, $docId, 0;
-  my $v;			# not used, but needed by c_get()
-  my $status = $c->c_get($k, $v, DB_SET_RANGE);
-  if ($status == 0) {
-    my ($check, $wordId) = unpack IXPKEYPACK, $k;
-    confess "docId $docId is already used (wordId=$wordId)" if $docId == $check;
+  if ($self->{ixp}) { # can only check if we have the positions index
+    my $c = $self->{ixpDb}->db_cursor;
+    my $k = pack IXPKEYPACK, $docId, 0;
+    my $v;			# not used, but needed by c_get()
+    my $status = $c->c_get($k, $v, DB_SET_RANGE);
+    if ($status == 0) {
+      my ($check, $wordId) = unpack IXPKEYPACK, $k;
+      croak "docId $docId is already used (wordId=$wordId)" 
+        if $docId == $check;
+    }
   }
 
   # OK, let's extract words from the $_[0] buffer
@@ -363,8 +398,10 @@ sub add {
     $occurrences = 255 if $occurrences > 255;
 
     $self->{ixd}{$wordId} .= pack(IXDPACK, $docId, $occurrences);
-    my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
-    $self->{ixp}{$ixpKey} =  pack(IXPPACK, @{$positions{$wordId}});
+    if ($self->{ixp}) {
+      my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
+      $self->{ixp}{$ixpKey} =  pack(IXPPACK, @{$positions{$wordId}});
+    }
   }
 
   $self->{ixd}{NDOCS} = 0  if not defined $self->{ixd}{NDOCS};
@@ -389,8 +426,10 @@ sub remove {
     my %docs = unpack IXDPACK_L, $self->{ixd}{$wordId};
     delete $docs{$docId};
     $self->{ixd}{$wordId} = pack IXDPACK_L, %docs;
-    my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
-    delete $self->{ixp}{$ixpKey};
+    if ($self->{ixp}) {
+      my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
+      delete $self->{ixp}{$ixpKey};
+    }
   }
 
   $self->{ixd}{NDOCS} -= 1;
@@ -399,12 +438,16 @@ sub remove {
 =item C<wordIds(docId)>
 
 Returns a ref to an array of word Ids contained in the specified document
+(not available if the index was created with C<< positions => 0 >>)
 
 =cut
 
 sub wordIds {
   my $self = shift;
   my $docId_ini = shift;
+
+  $self->{ixpDb} 
+    or croak "wordIds() not available (index was created with positions=>0)";
 
   my @wordIds = ();
   my $c = $self->{ixpDb}->db_cursor;
@@ -522,8 +565,7 @@ sub search {
 
 
 sub _search {
-  my $self = shift;
-  my $q = shift;
+  my ($self, $q) = @_;
 
   my $scores = undef;		# hash {doc1 => score1, doc2 => score2 ...}
 
@@ -575,60 +617,92 @@ sub _search {
 
 
 sub docsAndScores { # returns a hash {docId => score} or undef (no info)
-  my $self = shift;
-  my $subQ = shift;
+  my ($self, $subQ) = @_;
 
   # recursive call to _search if $subQ is a parenthesized query
   return $self->_search($subQ->{value}) if $subQ->{op} eq '()';
 
   # otherwise, don't care about $subQ->{op} (assert $subQ->{op} eq ':')
-  my $scores = undef;
 
-  if (not ref $subQ->{value}) { # scalar value, match single word
-    if ($subQ->{value} > -1) {    # if this is not a stopword
-      $scores = {unpack IXDPACK_L, ($self->{ixd}{$subQ->{value}} || "")};
-      my @k = keys %$scores;
-      if (@k) {
-	my $coeff = log(($self->{ixd}{NDOCS} + 1)/@k) * 100;
-	$scores->{$_} = int($coeff * $scores->{$_}) foreach @k;
-      }
+  if (ref $subQ->{value}) { # several words, this is an "exact phrase"
+    return $self->matchExactPhrase($subQ);
+  }
+  elsif ($subQ->{value} <= -1) {# this is a stopword
+    return undef;
+  }
+  else { # scalar value, match single word
+    my $scores = {unpack IXDPACK_L, ($self->{ixd}{$subQ->{value}} || "")};
+    my @k = keys %$scores;
+    if (@k) {
+      my $coeff = log(($self->{ixd}{NDOCS} + 1)/@k) * 100;
+      $scores->{$_} = int($coeff * $scores->{$_}) foreach @k;
     }
+    return $scores;
   }
-  else {                        # list of words, match exact phrase
-    my %pos;
-    my $wordDelta = 0;
-    foreach my $wordId (@{$subQ->{value}}) {
-      my $sc = $self->docsAndScores({op=>':', value=>$wordId});
-      if (not $scores) { # no previous result set
-	if ($sc) {
-	  $scores = $sc;
-	  foreach my $docId (keys %$scores) {
-	    my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
-	    $pos{$docId} = [unpack IXPPACK, $self->{ixp}{$ixpKey}];
-	  }
-	}
+}
+
+
+sub matchExactPhrase {
+  my ($self, $subQ) = @_;
+
+  if (! $self->{ixp}) { # if not indexed with positions
+    # translate into an AND query
+    my $fake_query = {'+' => [map {{op    => ':',
+                                    value => $_  }} @{$subQ->{value}}]};
+    # and search for that one
+    return $self->_search($fake_query);
+  };
+
+  # otherwise, intersect word position sets
+  my %pos;
+  my $wordDelta = 0;
+  my $scores = undef;
+  foreach my $wordId (@{$subQ->{value}}) {
+    my $sc = $self->docsAndScores({op=>':', value=>$wordId});
+    if (not $scores) {          # no previous result set
+      if ($sc) {
+        $scores = $sc;
+        foreach my $docId (keys %$scores) {
+          my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
+          $pos{$docId} = [unpack IXPPACK, $self->{ixp}{$ixpKey}];
+        }
       }
-      else { # combine with previous result set
-        $wordDelta++; 
-	foreach my $docId (keys %$scores) {
-	  if ($sc) { # if we have info about current word (is not a stopword)
-	    if (not defined $sc->{$docId}) { # current word not in current doc
-	      delete $scores->{$docId};
-	    }
-	    else { # current word found in current doc, check if positions match
-	      my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
-	      my @newPos = unpack IXPPACK, $self->{ixp}{$ixpKey};
-	      $pos{$docId} = nearPositions($pos{$docId}, \@newPos, $wordDelta)
-		and addToScore $scores->{$docId}, $sc->{$docId}
-		  or delete $scores->{$docId};
-	    }
-	  }
-	} # end foreach my $docId (keys %$scores)
-      }
-    } # end foreach my $wordId (@{$subQ->{value}})
-  }
+    } 
+    else {                    # combine with previous result set
+      $wordDelta++; 
+      foreach my $docId (keys %$scores) {
+        if ($sc) { # if we have info about current word (is not a stopword)
+          if (not defined $sc->{$docId}) { # current word not in current doc
+            delete $scores->{$docId};
+          } else { # current word found in current doc, check if positions match
+            my $ixpKey = pack IXPKEYPACK, $docId, $wordId;
+            my @newPos = unpack IXPPACK, $self->{ixp}{$ixpKey};
+            $pos{$docId} = nearPositions($pos{$docId}, \@newPos, $wordDelta)
+              and addToScore $scores->{$docId}, $sc->{$docId}
+                or delete $scores->{$docId};
+          }
+        }
+      }  # end foreach my $docId (keys %$scores)
+    }
+  } # end foreach my $wordId (@{$subQ->{value}})
+
   return $scores;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 sub nearPositions { 
@@ -816,3 +890,4 @@ I haven't done any benchmarks yet to compare performance.
 =cut
 
 	
+1;
