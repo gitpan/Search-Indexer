@@ -1,24 +1,24 @@
---- #YAML:1.0
-name:               Search-Indexer
-version:            0.76
-abstract:           full-text indexer
+---
+abstract: 'full-text indexer'
 author:
-    - Laurent Dami <laurent.dami AT etat ge ch>
-license:            unknown
-distribution_type:  module
-configure_requires:
-    ExtUtils::MakeMaker:  0
+  - 'Laurent Dami <laurent.dami AT etat ge ch>'
 build_requires:
-    ExtUtils::MakeMaker:  0
-requires:
-    BerkeleyDB:           0.22
-    List::MoreUtils:      0
-    Search::QueryParser:  0.91
-no_index:
-    directory:
-        - t
-        - inc
-generated_by:       ExtUtils::MakeMaker version 6.52
+  ExtUtils::MakeMaker: 0
+configure_requires:
+  ExtUtils::MakeMaker: 0
+dynamic_config: 1
+generated_by: 'ExtUtils::MakeMaker version 6.64, CPAN::Meta::Converter version 2.120921'
+license: unknown
 meta-spec:
-    url:      http://module-build.sourceforge.net/META-spec-v1.4.html
-    version:  1.4
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: Search-Indexer
+no_index:
+  directory:
+    - t
+    - inc
+requires:
+  BerkeleyDB: 0.22
+  List::MoreUtils: 0
+  Search::QueryParser: 0.91
+version: 0.77

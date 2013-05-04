@@ -31,3 +31,4 @@ t/data/book9
 t/data/preface
 lib/Search/Indexer.pm
 META.yml                                 Module meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
